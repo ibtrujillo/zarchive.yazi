@@ -39,6 +39,7 @@ local function stage(paths, names)
 end
 
 local function compress_command(key, out, items, pwd, header, vol)
+  -- shortcut: 7zz takes -p in argv (visible in ps); no password-file or stdin form works for 7zz t, upgrade if 7zz gains one
   local enc = pwd and { "-p" .. pwd } or {}
   local split = vol and { "-v" .. vol } or {}
   if P.FORMATS[key].tar then
