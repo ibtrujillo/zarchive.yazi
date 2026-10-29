@@ -2,17 +2,6 @@ local P = require("zeppelin")
 
 local M = {}
 
-local function join(...)
-  local t = {}
-  for _, list in ipairs { ... } do
-    for _, v in ipairs(list) do
-      t[#t + 1] = v
-    end
-  end
-  return t
-end
-
-
 local yanked = ya.sync(function()
   local items = {}
   for _, f in pairs(cx.yanked) do
@@ -20,6 +9,10 @@ local yanked = ya.sync(function()
   end
   return { cwd = tostring(cx.active.current.cwd), items = items }
 end)
+
+local function notify_error(content)
+  ya.notify { title = "Compress", content = content, level = "error", timeout = 10 }
+end
 
 local function stage(paths, names)
   local root = P.temp_dir()
@@ -38,26 +31,6 @@ local function stage(paths, names)
   return root
 end
 
-local function compress_command(key, out, items, pwd, header, vol)
-  -- shortcut: 7zz takes -p in argv (visible in ps); no password-file or stdin form works for 7zz t, upgrade if 7zz gains one
-  local enc = pwd and { "-p" .. pwd } or {}
-  local split = vol and { "-v" .. vol } or {}
-  if P.FORMATS[key].tar then
-    local script = '7zz a -ttar -so x.tar "${@:2}" | 7zz a -t' .. P.FORMATS[key].tar .. ' -si "$1"'
-    return Command("bash"):arg(join({ "-o", "pipefail", "-c", script, "_", out }, items))
-  elseif key == "zip" then
-    return Command("7zz"):arg(join({ "a", "-tzip" }, pwd and { "-mem=AES256" } or {}, enc, split, { out }, items))
-  elseif key == "7z" then
-    return Command("7zz"):arg(join({ "a" }, header and { "-mhe=on" } or {}, enc, split, { out }, items))
-  elseif key == "tar" then
-    return Command("7zz"):arg(join({ "a", "-ttar", out }, items))
-  elseif key == "gz" then
-    return Command("7zz"):arg(join({ "a", "-tgzip", out }, items))
-  elseif key == "rar" then
-    return Command("rar"):arg(join({ "a" }, pwd and { (header and "-hp@" or "-p@") .. pwd } or {}, split, { out }, items))
-  end
-end
-
 local function unique_path(cwd, base, suffix)
   local name, n = base .. suffix, 0
   while fs.cha(Url(cwd .. "/" .. name)) do
@@ -67,30 +40,59 @@ local function unique_path(cwd, base, suffix)
   return cwd .. "/" .. name
 end
 
--- shortcut: confirm body has no scroll view, shows CONFIRM_MAX_LINES lines and "… N more"; replace with native scroll when yazi offers one for ya.confirm
-local CONFIRM_MAX_LINES = 11
+local function item_paths(items)
+  local paths = {}
+  for i, it in ipairs(items) do
+    paths[i] = it.path
+  end
+  return paths
+end
 
-local function confirm_list(sel)
-  local lines = {}
-  local total = #sel.items
-  local shown = total > CONFIRM_MAX_LINES and CONFIRM_MAX_LINES - 1 or total
-  for i = 1, shown do
-    local it = sel.items[i]
-    local icon = th.icon:match(File { url = Url(it.path), cha = Cha { mode = tonumber(it.dir and "40700" or "100644", 8) } })
-    lines[#lines + 1] = ui.Line { ui.Span("  "), icon and ui.Span(icon.text .. " "):style(icon.style) or ui.Span("  "), ui.Span(it.path) }:align(ui.Align.LEFT)
+local function all_exist(items)
+  for _, it in ipairs(items) do
+    if not fs.cha(Url(it.path)) then
+      notify_error("Yanked item missing: " .. it.path .. " (yank again)")
+      return false
+    end
   end
-  if total > shown then
-    lines[#lines + 1] = ui.Line { ui.Span(string.format("  \u{2026} %d more", total - shown)) }:align(ui.Align.LEFT)
+  return true
+end
+
+local function ask_name(cwd)
+  local default = cwd:match("[^/]+$") or "archive"
+  local name, event = ya.input { pos = { "top-center", y = 2, w = 50 }, title = "Archive name:", value = default .. ".zip" }
+  if event ~= 1 or name == "" then
+    return
   end
-  return ya.confirm {
-    pos = { "center", w = 80, h = math.min(#lines + 4, 30) },
-    title = string.format("Compress %d selected files?", #sel.items),
-    body = ui.Text(lines):align(ui.Align.LEFT),
-  }
+  return name
+end
+
+local function ask_volume()
+  local value, event = ya.input { pos = { "top-center", y = 2, w = 50 }, title = "Parts (e.g. 4) or volume size (e.g. 5.5MB, 89kiB):" }
+  if event ~= 1 or value == "" then
+    return
+  end
+  return value
+end
+
+local function ask_password(fmt)
+  local value, event = ya.input { pos = { "top-center", y = 2, w = 50 }, title = "Password (empty = none):", obscure = true }
+  if event ~= 1 or value == "" then
+    return nil, event == 1
+  end
+  local header
+  if fmt.header then
+    header = ya.confirm {
+      pos = { "center", w = 60, h = 8 },
+      title = "Encrypt file names?",
+      body = ui.Text("Without this, file names stay visible without the password."),
+    }
+  end
+  return value, header, true
 end
 
 local function selection_bytes(paths)
-  local out = Command("du"):arg(join({ "-sbL", "--" }, paths)):stdin(Command.NULL):stderr(Command.NULL):output()
+  local out = Command("du"):arg(P.join({ "-sbL", "--" }, paths)):stdin(Command.NULL):stderr(Command.NULL):output()
   if not out or not out.status.success then
     return
   end
@@ -106,115 +108,27 @@ local function volume_size(spec, paths)
   if not total then
     return nil, "Cannot measure selection"
   end
-  local bytes, err = P.volume_bytes(spec, total)
-  if not bytes then
-    return nil, err
-  end
-  return bytes
+  return P.volume_bytes(spec, total)
 end
 
-local function compress(split)
-  local sel = yanked()
-  if #sel.items == 0 then
-    ya.notify { title = "Compress", content = "Nothing yanked: select with space, then y", level = "warn", timeout = 5 }
-    return
+local function password_arg(key, pwd)
+  if not (pwd and key == "rar") then
+    return pwd
   end
+  local dir = P.password_file(pwd)
+  if dir then
+    return dir .. "/pw", dir
+  end
+end
 
-  local paths = {}
-  for _, it in ipairs(sel.items) do
-    if not fs.cha(Url(it.path)) then
-      ya.notify { title = "Compress", content = "Yanked item missing: " .. it.path .. " (yank again)", level = "error", timeout = 10 }
-      return
-    end
-    paths[#paths + 1] = it.path
-  end
+local function run_archive(root, names, cwd, base, key, pwd, header, vol)
+  local out = unique_path(cwd, base, "." .. key)
+  local program, args = P.archive_command(key, out, names, pwd, header, vol)
+  local res = Command(program):arg(args):cwd(root):stdin(Command.NULL):stdout(Command.NULL):stderr(Command.PIPED):output()
+  return res, out
+end
 
-  if not confirm_list(sel) then
-    return
-  end
-
-  local default = sel.cwd:match("[^/]+$") or "archive"
-  local name, event = ya.input { pos = { "top-center", y = 2, w = 50 }, title = "Archive name:", value = default .. ".zip" }
-  if event ~= 1 or name == "" then
-    return
-  end
-  local base, key = P.split_format(name)
-  if not key then
-    ya.notify { title = "Compress", content = "Unknown archive format", level = "error", timeout = 10 }
-    return
-  end
-
-  local fmt = P.FORMATS[key]
-  if split and not fmt.split then
-    ya.notify { title = "Compress", content = "Format has no multi-volume support", level = "error", timeout = 10 }
-    return
-  end
-
-  local spec
-  if split then
-    local value, sevent = ya.input { pos = { "top-center", y = 2, w = 50 }, title = "Parts (e.g. 4) or volume size (e.g. 5.5MB, 89kiB):" }
-    if sevent ~= 1 or value == "" then
-      return
-    end
-    spec = value
-  end
-
-  local pwd, header
-  if fmt.password then
-    local value, pevent = ya.input { pos = { "top-center", y = 2, w = 50 }, title = "Password (empty = none):", obscure = true }
-    if pevent ~= 1 then
-      return
-    end
-    if value ~= "" then
-      pwd = value
-      if fmt.header then
-        header = ya.confirm {
-          pos = { "center", w = 60, h = 8 },
-          title = "Encrypt file names?",
-          body = ui.Text("Without this, file names stay visible without the password."),
-        }
-      end
-    end
-  end
-
-  local entries = P.drop_nested(paths)
-  local vol, why
-  if spec then
-    vol, why = volume_size(spec, entries)
-    if not vol then
-      ya.notify { title = "Compress", content = why, level = "error", timeout = 10 }
-      return
-    end
-  end
-
-  local pwdir
-  if pwd and key == "rar" then
-    pwdir = P.password_file(pwd)
-    if not pwdir then
-      ya.notify { title = "Compress", content = "Failed to store password", level = "error", timeout = 10 }
-      return
-    end
-    pwd = pwdir .. "/pw"
-  end
-
-  local names = P.entry_names(entries)
-  local root = stage(entries, names)
-  if not root then
-    if pwdir then
-      Command("rm"):arg({ "-rf", pwdir }):output()
-    end
-    ya.notify { title = "Compress", content = "Failed to stage selection", level = "error", timeout = 10 }
-    return
-  end
-
-  local out = unique_path(sel.cwd, base, "." .. key)
-  local cmd = compress_command(key, out, names, pwd, header, vol)
-  local res = cmd and cmd:cwd(root):stdin(Command.NULL):stdout(Command.NULL):stderr(Command.PIPED):output()
-  Command("rm"):arg({ "-rf", root }):output()
-  if pwdir then
-    Command("rm"):arg({ "-rf", pwdir }):output()
-  end
-
+local function report(res, out)
   ya.emit("escape", {})
   if res and res.status.success then
     return
@@ -226,7 +140,82 @@ local function compress(split)
   if res then
     msg = res.stderr:find("Incorrect password", 1, true) and "Incorrect password" or res.stderr:match("[^\r\n]+") or "compressor failed"
   end
-  ya.notify { title = "Compress", content = msg, level = "error", timeout = 10 }
+  notify_error(msg)
+end
+
+local function compress(split)
+  local sel = yanked()
+  if #sel.items == 0 then
+    ya.notify { title = "Compress", content = "Nothing yanked: select with space, then y", level = "warn", timeout = 5 }
+    return
+  end
+  if not all_exist(sel.items) then
+    return
+  end
+  if not P.confirm_list(sel.items, string.format("Compress %d selected files?", #sel.items)) then
+    return
+  end
+
+  local name = ask_name(sel.cwd)
+  if not name then
+    return
+  end
+  local base, key = P.split_format(name)
+  if not key then
+    return notify_error("Unknown archive format")
+  end
+  local fmt = P.FORMATS[key]
+  if split and not fmt.split then
+    return notify_error("Format has no multi-volume support")
+  end
+
+  local spec
+  if split then
+    spec = ask_volume()
+    if not spec then
+      return
+    end
+  end
+
+  local pwd, header, asked = nil, nil, true
+  if fmt.password then
+    pwd, header, asked = ask_password(fmt)
+  end
+  if not asked then
+    return
+  end
+
+  local entries = P.drop_nested(item_paths(sel.items))
+
+  local vol
+  if spec then
+    local why
+    vol, why = volume_size(spec, entries)
+    if not vol then
+      return notify_error(why)
+    end
+  end
+
+  local pwd_arg, pwdir = password_arg(key, pwd)
+  if pwd and not pwd_arg then
+    return notify_error("Failed to store password")
+  end
+
+  local names = P.entry_names(entries)
+  local root = stage(entries, names)
+  if not root then
+    if pwdir then
+      Command("rm"):arg({ "-rf", pwdir }):output()
+    end
+    return notify_error("Failed to stage selection")
+  end
+
+  local res, out = run_archive(root, names, sel.cwd, base, key, pwd_arg, header, vol)
+  Command("rm"):arg({ "-rf", root }):output()
+  if pwdir then
+    Command("rm"):arg({ "-rf", pwdir }):output()
+  end
+  report(res, out)
 end
 
 function M:entry(job)
