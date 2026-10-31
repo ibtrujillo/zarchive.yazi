@@ -77,8 +77,11 @@ end
 
 local function ask_password(fmt)
   local value, event = ya.input { pos = { "top-center", y = 2, w = 50 }, title = "Password (empty = none):", obscure = true }
-  if event ~= 1 or value == "" then
-    return nil, event == 1
+  if event ~= 1 then
+    return nil, nil, false
+  end
+  if value == "" then
+    return nil, nil, true
   end
   local header
   if fmt.header then
