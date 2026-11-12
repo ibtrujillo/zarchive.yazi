@@ -1,3 +1,5 @@
+--- @since 26.9.1
+
 local P = require("zeppelin")
 
 local M = {}
