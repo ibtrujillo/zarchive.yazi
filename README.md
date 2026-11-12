@@ -12,8 +12,8 @@ optional password encryption and multi-volume split output.
 ## Installation
 
 ```sh
-ya pkg add ibtrujillo/zarchive.yazi
-ya pkg add ibtrujillo/zeppelin.yazi
+ya pkg add ibtrujillo/zarchive
+ya pkg add ibtrujillo/zeppelin
 ```
 
 ## Usage
